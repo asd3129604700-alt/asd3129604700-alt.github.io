@@ -1,0 +1,254 @@
+name: Build, Release & Submit Extensions
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      listing_tag:
+        description: 'Sync Firefox listing only, using this existing stable release (e.g. v0.8.3)'
+        required: true
+        type: string
+
+concurrency:
+  group: extension-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'DonutShinobu/ShinobuTranslator' &&
+      startsWith(github.event.release.tag_name, 'v') &&
+      !startsWith(github.event.release.tag_name, 'models-') &&
+      github.event.release.draft == false &&
+      github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      EXTENSION_CHROMIUM_DIST: apps/extension/dist-chromium
+      EXTENSION_FIREFOX_DIST: apps/extension/dist-firefox
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read pinned model release
+        id: models
+        run: echo "tag=$(jq -r .tag apps/extension/model-release.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify pinned models
+        run: npm run models:download -- "${{ steps.models.outputs.tag }}"
+
+      - name: Run quality gates and dual-target build
+        run: npm run check
+
+      - name: Firefox lint audit
+        run: npm run lint:firefox --workspace=@shinobu/extension
+
+      - name: Verify tag and all extension versions
+        run: |
+          TAG_VERSION="${{ github.event.release.tag_name }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          PACKAGE_VERSION=$(jq -r .version apps/extension/package.json)
+          CHROMIUM_VERSION=$(jq -r .version "$EXTENSION_CHROMIUM_DIST/manifest.json")
+          FIREFOX_VERSION=$(jq -r .version "$EXTENSION_FIREFOX_DIST/manifest.json")
+          test "$TAG_VERSION" = "$PACKAGE_VERSION"
+          test "$TAG_VERSION" = "$CHROMIUM_VERSION"
+          test "$TAG_VERSION" = "$FIREFOX_VERSION"
+
+      - name: Generate parity report
+        run: |
+          node scripts/check-extension-parity.mjs \
+            --chromium "$EXTENSION_CHROMIUM_DIST" \
+            --firefox "$EXTENSION_FIREFOX_DIST" \
+            --report artifacts/extension-parity-report.json
+
+      - name: Package reproducible artifacts and enforce budgets
+        run: |
+          node scripts/package-extensions.mjs \
+            --chromium "$EXTENSION_CHROMIUM_DIST" \
+            --firefox "$EXTENSION_FIREFOX_DIST" \
+            --artifacts artifacts
+
+      - name: Upload all release artifacts
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            artifacts/ShinobuTranslator-chromium-*.zip \
+            artifacts/ShinobuTranslator-firefox-*.zip \
+            artifacts/ShinobuTranslator-source-*.zip \
+            artifacts/SHA256SUMS.txt \
+            artifacts/extension-parity-report.json \
+            --repo "${{ github.repository }}" \
+            --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Share verified store submission artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-store-submission
+          path: |
+            artifacts/ShinobuTranslator-chromium-*.zip
+            artifacts/ShinobuTranslator-firefox-*.zip
+            artifacts/ShinobuTranslator-source-*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish_chrome:
+    if: github.repository == 'DonutShinobu/ShinobuTranslator'
+    name: Submit Chrome Web Store update
+    needs: build
+    runs-on: ubuntu-latest
+    environment: browser-stores
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Download verified store submission artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-store-submission
+          path: store-artifacts
+
+      - name: Validate Chrome Web Store configuration
+        env:
+          WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SERVICE_ACCOUNT: ${{ vars.GCP_CHROME_WEBSTORE_SERVICE_ACCOUNT }}
+          PUBLISHER_ID: ${{ vars.CHROME_WEBSTORE_PUBLISHER_ID }}
+          EXTENSION_ID: ${{ vars.CHROME_WEBSTORE_EXTENSION_ID }}
+        run: |
+          test -n "$WORKLOAD_IDENTITY_PROVIDER"
+          test -n "$SERVICE_ACCOUNT"
+          test -n "$PUBLISHER_ID"
+          test "$EXTENSION_ID" = "pgehhpbnifjlalmmnpiebkjhphojffef"
+
+      - name: Authenticate to Google Cloud
+        id: google-auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CHROME_WEBSTORE_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/chromewebstore
+
+      - name: Upload and submit Chrome update
+        env:
+          CHROME_WEBSTORE_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+          CHROME_WEBSTORE_PUBLISHER_ID: ${{ vars.CHROME_WEBSTORE_PUBLISHER_ID }}
+          CHROME_WEBSTORE_EXTENSION_ID: ${{ vars.CHROME_WEBSTORE_EXTENSION_ID }}
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          PACKAGE=$(find store-artifacts -maxdepth 1 -name "ShinobuTranslator-chromium-v${VERSION}.zip" -print -quit)
+          test -n "$PACKAGE"
+          node scripts/publish-chrome-web-store.mjs \
+            --package "$PACKAGE" \
+            --version "$VERSION"
+
+  publish_firefox:
+    if: github.repository == 'DonutShinobu/ShinobuTranslator'
+    name: Submit Firefox AMO update
+    needs: build
+    runs-on: ubuntu-latest
+    environment: browser-stores
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install locked web-ext
+        run: npm ci --ignore-scripts
+
+      - name: Download verified store submission artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-store-submission
+          path: store-artifacts
+
+      - name: Extract Firefox submission package
+        id: firefox-package
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          FIREFOX_ARCHIVE=$(find store-artifacts -maxdepth 1 -name "ShinobuTranslator-firefox-v${VERSION}.zip" -print -quit)
+          SOURCE_ARCHIVE=$(find store-artifacts -maxdepth 1 -name "ShinobuTranslator-source-v${VERSION}.zip" -print -quit)
+          test -n "$FIREFOX_ARCHIVE"
+          test -n "$SOURCE_ARCHIVE"
+          mkdir -p "$RUNNER_TEMP/firefox-dist" "$RUNNER_TEMP/amo-signed"
+          unzip -q "$FIREFOX_ARCHIVE" -d "$RUNNER_TEMP/firefox-dist"
+          echo "source-dir=$RUNNER_TEMP/firefox-dist" >> "$GITHUB_OUTPUT"
+          echo "source-archive=$SOURCE_ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "artifacts-dir=$RUNNER_TEMP/amo-signed" >> "$GITHUB_OUTPUT"
+
+      - name: Submit listed Firefox build to AMO
+        run: |
+          npx --no-install web-ext sign \
+            --source-dir "${{ steps.firefox-package.outputs.source-dir }}" \
+            --artifacts-dir "${{ steps.firefox-package.outputs.artifacts-dir }}" \
+            --channel listed \
+            --api-key "$WEB_EXT_API_KEY" \
+            --api-secret "$WEB_EXT_API_SECRET" \
+            --amo-metadata apps/extension/amo/metadata.json \
+            --upload-source-code "${{ steps.firefox-package.outputs.source-archive }}" \
+            --approval-timeout 0 \
+            --no-input
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
+
+  sync_firefox_listing:
+    name: Sync Firefox store listing
+    concurrency:
+      group: firefox-store-listing
+      cancel-in-progress: false
+    needs: publish_firefox
+    if: github.repository == 'DonutShinobu/ShinobuTranslator' && (always() && (needs.publish_firefox.result == 'success' || github.event_name == 'workflow_dispatch'))
+    runs-on: ubuntu-latest
+    environment: browser-stores
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Read stable release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.listing_tag }}
+        run: gh release view "$RELEASE_TAG" --json tagName,body,isDraft,isPrerelease > "$RUNNER_TEMP/firefox-listing-release.json"
+      - name: Copy Chrome listing and GitHub release notes to AMO
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
+        run: npx --no-install tsx scripts/sync-firefox-listing.ts "$RUNNER_TEMP/firefox-listing-release.json"
